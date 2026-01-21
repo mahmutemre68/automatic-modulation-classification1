@@ -1,0 +1,140 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix
+import itertools
+
+# 1. data generation
+NUM_SAMPLES = 1000
+SEQ_LEN = 128
+SNR_RANGE = range(-5, 20, 5)
+
+def generate_signals(n, length):
+    # BPSK
+    bits_bpsk = np.random.randint(0, 2, (n, length))
+    bpsk = (2 * bits_bpsk - 1) + 1j * 0
+    
+    # QPSK
+    bits_qpsk = np.random.randint(0, 4, (n, length))
+    phase_qpsk = (np.pi / 4) + (bits_qpsk * np.pi / 2)
+    qpsk = np.exp(1j * phase_qpsk)
+    
+    # 8PSK
+    bits_8psk = np.random.randint(0, 8, (n, length))
+    phase_8psk = bits_8psk * (np.pi / 4)
+    psk8 = np.exp(1j * phase_8psk)
+    
+    return bpsk, qpsk, psk8
+
+def add_awgn(signal, snr_db):
+    sig_power = np.mean(np.abs(signal)**2)
+    noise_power = sig_power / (10 ** (snr_db / 10))
+    noise = (np.sqrt(noise_power/2) * (np.random.randn(*signal.shape) + 1j * np.random.randn(*signal.shape)))
+    return signal + noise
+
+print("Veri Üretiliyor...")
+dataset = []
+labels = []
+
+for snr in SNR_RANGE:
+    bpsk, qpsk, psk8 = generate_signals(NUM_SAMPLES, SEQ_LEN)
+    
+    dataset.append(add_awgn(bpsk, snr)); labels.append(np.zeros(NUM_SAMPLES))
+    dataset.append(add_awgn(qpsk, snr)); labels.append(np.ones(NUM_SAMPLES))
+    dataset.append(add_awgn(psk8, snr)); labels.append(np.full(NUM_SAMPLES, 2))
+
+X_complex = np.vstack(dataset)
+y = np.hstack(labels)
+
+# 2. data preparation for PyTorch
+# PyTorch Conv1D Girişi: (Batch, Channel, Length) -> (N, 2, 128)
+X_real = X_complex.real
+X_imag = X_complex.imag
+X_pytorch = np.stack((X_real, X_imag), axis=1) # Kanal boyutu 2. sıraya gelir
+
+# Tensor'a çevir (PyTorch'un anlayacağı format)
+X_tensor = torch.tensor(X_pytorch, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.long)
+
+X_train, X_test, y_train, y_test = train_test_split(X_tensor, y_tensor, test_size=0.2, random_state=42)
+
+print(f"Veri Hazır. PyTorch Tensor Boyutu: {X_train.shape}") # [..., 2, 128] olmalı
+
+# 3. CNN model architecture
+class SignalCNN(nn.Module):
+    def __init__(self):
+        super(SignalCNN, self).__init__()
+        # Katman 1: Sinyaldeki ani değişimleri yakala
+        self.conv1 = nn.Conv1d(in_channels=2, out_channels=64, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool1d(kernel_size=2)
+        
+        # Katman 2: Daha derin özellikleri yakala
+        self.conv2 = nn.Conv1d(in_channels=64, out_channels=32, kernel_size=3, padding=1)
+        
+        # Tam Bağlantılı Katmanlar (Classification)
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(32 * (SEQ_LEN // 4), 128) # Boyut yarıya iki kez düştü (128->64->32)
+        self.fc2 = nn.Linear(128, 3) # 3 Sınıf (BPSK, QPSK, 8PSK)
+
+    def forward(self, x):
+        x = self.pool(self.relu(self.conv1(x)))
+        x = self.pool(self.relu(self.conv2(x)))
+        x = self.flatten(x)
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+model = SignalCNN()
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# 4. training cycle
+print("CNN Eğitimi Başlıyor...")
+EPOCHS = 15
+batch_size = 64
+
+loss_history = []
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss = 0.0
+    
+    # Mini-batch işlemi (Basitleştirilmiş)
+    permutation = torch.randperm(X_train.size()[0])
+    
+    for i in range(0, X_train.size()[0], batch_size):
+        indices = permutation[i:i+batch_size]
+        batch_x, batch_y = X_train[indices], y_train[indices]
+        
+        optimizer.zero_grad()       # Gradyanları sıfırla
+        outputs = model(batch_x)    # Tahmin yap
+        loss = criterion(outputs, batch_y) # Hatayı hesapla
+        loss.backward()             # Geri yayılım (Backprop)
+        optimizer.step()            # Ağırlıkları güncelle
+        
+        running_loss += loss.item()
+        
+    avg_loss = running_loss / (X_train.size()[0] / batch_size)
+    loss_history.append(avg_loss)
+    print(f"Epoch {epoch+1}/{EPOCHS} -> Loss: {avg_loss:.4f}")
+
+# 5. Test and results
+model.eval()
+with torch.no_grad():
+    test_outputs = model(X_test)
+    _, predicted = torch.max(test_outputs, 1)
+    acc = accuracy_score(y_test, predicted)
+
+print(f"\nCNN Test Doğruluğu: %{acc*100:.2f}")
+
+# success curve
+plt.figure(figsize=(6,4))
+plt.plot(loss_history, label='Eğitim Kaybı')
+plt.title('learning curve')
+plt.xlabel('Epoch'); plt.ylabel('Loss')
+plt.legend(); plt.grid(True)
+plt.show()
